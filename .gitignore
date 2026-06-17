@@ -1,0 +1,3 @@
+model_roberta_pkn_summarizer/
+__pycache__/
+*.pyc
