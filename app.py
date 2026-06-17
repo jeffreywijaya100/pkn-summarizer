@@ -1,5 +1,7 @@
+import os
 import re
 import uuid
+import asyncio
 import traceback
 import numpy as np
 import torch
@@ -15,7 +17,7 @@ from text_struct import extract_pdf, build_structure, split_sentences
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SAVE_DIR = "jeffreywijaya100/model_roberta_pkn_summarizer"
-MAX_LEN  = 64
+MAX_LEN  = 96
 DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 app = FastAPI(title="PKN Summarizer")
@@ -59,6 +61,9 @@ async def load_model():
         tokenizer = AutoTokenizer.from_pretrained(SAVE_DIR)
         model = AutoModelForSequenceClassification.from_pretrained(SAVE_DIR).to(DEVICE)
         model.eval()
+        # Batasi thread torch di CPU agar tidak menghabiskan resource container
+        if DEVICE.type == "cpu":
+            torch.set_num_threads(max(1, (os.cpu_count() or 2) - 1))
         print(f"[OK] Model siap di {DEVICE}")
     except Exception as e:
         print(f"[ERROR] Gagal load model: {e}")
@@ -75,8 +80,8 @@ def cache_put(doc_id, nodes):
     while len(DOC_ORDER) > MAX_DOCS:
         DOC_CACHE.pop(DOC_ORDER.pop(0), None)
 
-# ── Inferensi RoBERTa ──────────────────────────────────────────────────────
-def predict_sentence_scores(sentences, batch_size=16):
+# ── Inferensi DistilBERT ──────────────────────────────────────────────────────
+def predict_sentence_scores(sentences, batch_size=32):
     scores = []
     with torch.no_grad():
         for i in range(0, len(sentences), batch_size):
@@ -106,7 +111,7 @@ TRUNCATED_RE = re.compile(
 )
 
 def score_sentence_quality(sentence: str, idx: int) -> float:
-    """Skor kualitas tambahan di luar skor RoBERTa."""
+    """Skor kualitas tambahan di luar skor DistillBERT."""
     score = 0.0
     s = sentence.strip()
 
@@ -133,12 +138,11 @@ def score_sentence_quality(sentence: str, idx: int) -> float:
     return score
 
 def summarize_text(text: str, top_k: int = 2) -> str:
-
     sentences = split_sentences(text)
     if not sentences:
         return text[:300].strip()
 
-    # Skor RoBERTa
+    # Skor DistillBERT
     bert_scores = predict_sentence_scores(sentences)
 
     # Gabung skor BERT + skor kualitas kalimat
@@ -209,10 +213,16 @@ async def summarize(payload: dict = Body(...)):
             status_code=404
         )
 
-    summaries = {}
-    for nid in ids:
-        content = nodes.get(nid, "").strip()
-        summaries[nid] = summarize_text(content, top_k=top_k) if content else ""
+    # Seluruh inferensi (CPU-bound, blocking) dijalankan di thread terpisah
+    # agar event loop tetap responsif membalas healthcheck Railway → cegah 502.
+    def _work():
+        out = {}
+        for nid in ids:
+            content = nodes.get(nid, "").strip()
+            out[nid] = summarize_text(content, top_k=top_k) if content else ""
+        return out
+
+    summaries = await asyncio.to_thread(_work)
 
     return JSONResponse({"summaries": summaries})
 
@@ -226,4 +236,7 @@ async def status():
     }
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    # Railway menyuntikkan PORT lewat env var; fallback 8000 untuk lokal.
+    # reload dimatikan agar aman di production.
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
