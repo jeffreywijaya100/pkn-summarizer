@@ -76,7 +76,7 @@ def cache_put(doc_id, nodes):
         DOC_CACHE.pop(DOC_ORDER.pop(0), None)
 
 # ── Inferensi RoBERTa ──────────────────────────────────────────────────────
-def predict_sentence_scores(sentences, batch_size=64):
+def predict_sentence_scores(sentences, batch_size=32):
     scores = []
     with torch.no_grad():
         for i in range(0, len(sentences), batch_size):
