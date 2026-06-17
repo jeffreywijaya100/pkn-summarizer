@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import asyncio
+import threading
 import traceback
 import numpy as np
 import torch
@@ -53,8 +54,8 @@ async def _unhandled(req, exc):
 tokenizer = None
 model     = None
 
-@app.on_event("startup")
-async def load_model():
+def load_model():
+    """Dijalankan di thread background supaya tidak memblokir startup uvicorn."""
     global tokenizer, model
     try:
         print(f"[INFO] Memuat tokenizer & model dari '{SAVE_DIR}' …")
@@ -69,6 +70,12 @@ async def load_model():
         print(f"[ERROR] Gagal load model: {e}")
         print(traceback.format_exc())
 
+@app.on_event("startup")
+async def kickoff_model_load():
+    # Startup langsung selesai; model di-load di belakang agar healthcheck cepat lolos
+    # dan container tidak di-restart Railway karena startup kelamaan.
+    threading.Thread(target=load_model, daemon=True).start()
+
 # ── Doc cache ─────────────────────────────────────────────────────────────────
 DOC_CACHE = {}
 DOC_ORDER = []
@@ -80,7 +87,7 @@ def cache_put(doc_id, nodes):
     while len(DOC_ORDER) > MAX_DOCS:
         DOC_CACHE.pop(DOC_ORDER.pop(0), None)
 
-# ── Inferensi DistilBERT ──────────────────────────────────────────────────────
+# ── Inferensi model ───────────────────────────────────────────────────────────
 def predict_sentence_scores(sentences, batch_size=32):
     scores = []
     with torch.no_grad():
@@ -111,7 +118,7 @@ TRUNCATED_RE = re.compile(
 )
 
 def score_sentence_quality(sentence: str, idx: int) -> float:
-    """Skor kualitas tambahan di luar skor DistillBERT."""
+    """Skor kualitas tambahan di luar skor model."""
     score = 0.0
     s = sentence.strip()
 
@@ -142,10 +149,10 @@ def summarize_text(text: str, top_k: int = 2) -> str:
     if not sentences:
         return text[:300].strip()
 
-    # Skor DistillBERT
+    # Skor model
     bert_scores = predict_sentence_scores(sentences)
 
-    # Gabung skor BERT + skor kualitas kalimat
+    # Gabung skor model + skor kualitas kalimat
     final_scores = [
         b + score_sentence_quality(s, i)
         for i, (s, b) in enumerate(zip(sentences, bert_scores))
