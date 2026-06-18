@@ -1,8 +1,5 @@
-import os
 import re
 import uuid
-import asyncio
-import threading
 import traceback
 import numpy as np
 import torch
@@ -18,7 +15,7 @@ from text_struct import extract_pdf, build_structure, split_sentences
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SAVE_DIR = "jeffreywijaya100/model_roberta_pkn_summarizer"
-MAX_LEN  = 96
+MAX_LEN  = 128
 DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 app = FastAPI(title="PKN Summarizer")
@@ -54,27 +51,18 @@ async def _unhandled(req, exc):
 tokenizer = None
 model     = None
 
-def load_model():
-    """Dijalankan di thread background supaya tidak memblokir startup uvicorn."""
+@app.on_event("startup")
+async def load_model():
     global tokenizer, model
     try:
         print(f"[INFO] Memuat tokenizer & model dari '{SAVE_DIR}' …")
         tokenizer = AutoTokenizer.from_pretrained(SAVE_DIR)
         model = AutoModelForSequenceClassification.from_pretrained(SAVE_DIR).to(DEVICE)
         model.eval()
-        # Batasi thread torch di CPU agar tidak menghabiskan resource container
-        if DEVICE.type == "cpu":
-            torch.set_num_threads(max(1, (os.cpu_count() or 2) - 1))
         print(f"[OK] Model siap di {DEVICE}")
     except Exception as e:
         print(f"[ERROR] Gagal load model: {e}")
         print(traceback.format_exc())
-
-@app.on_event("startup")
-async def kickoff_model_load():
-    # Startup langsung selesai; model di-load di belakang agar healthcheck cepat lolos
-    # dan container tidak di-restart Railway karena startup kelamaan.
-    threading.Thread(target=load_model, daemon=True).start()
 
 # ── Doc cache ─────────────────────────────────────────────────────────────────
 DOC_CACHE = {}
@@ -87,7 +75,7 @@ def cache_put(doc_id, nodes):
     while len(DOC_ORDER) > MAX_DOCS:
         DOC_CACHE.pop(DOC_ORDER.pop(0), None)
 
-# ── Inferensi model ───────────────────────────────────────────────────────────
+# ── Inferensi RoBERTa ──────────────────────────────────────────────────────
 def predict_sentence_scores(sentences, batch_size=32):
     scores = []
     with torch.no_grad():
@@ -118,7 +106,7 @@ TRUNCATED_RE = re.compile(
 )
 
 def score_sentence_quality(sentence: str, idx: int) -> float:
-    """Skor kualitas tambahan di luar skor model."""
+    """Skor kualitas tambahan di luar skor RoBERTa."""
     score = 0.0
     s = sentence.strip()
 
@@ -145,14 +133,15 @@ def score_sentence_quality(sentence: str, idx: int) -> float:
     return score
 
 def summarize_text(text: str, top_k: int = 2) -> str:
+
     sentences = split_sentences(text)
     if not sentences:
         return text[:300].strip()
 
-    # Skor model
+    # Skor RoBERTa
     bert_scores = predict_sentence_scores(sentences)
 
-    # Gabung skor model + skor kualitas kalimat
+    # Gabung skor BERT + skor kualitas kalimat
     final_scores = [
         b + score_sentence_quality(s, i)
         for i, (s, b) in enumerate(zip(sentences, bert_scores))
@@ -220,16 +209,10 @@ async def summarize(payload: dict = Body(...)):
             status_code=404
         )
 
-    # Seluruh inferensi (CPU-bound, blocking) dijalankan di thread terpisah
-    # agar event loop tetap responsif membalas healthcheck Railway → cegah 502.
-    def _work():
-        out = {}
-        for nid in ids:
-            content = nodes.get(nid, "").strip()
-            out[nid] = summarize_text(content, top_k=top_k) if content else ""
-        return out
-
-    summaries = await asyncio.to_thread(_work)
+    summaries = {}
+    for nid in ids:
+        content = nodes.get(nid, "").strip()
+        summaries[nid] = summarize_text(content, top_k=top_k) if content else ""
 
     return JSONResponse({"summaries": summaries})
 
@@ -243,7 +226,4 @@ async def status():
     }
 
 if __name__ == "__main__":
-    # Railway menyuntikkan PORT lewat env var; fallback 8000 untuk lokal.
-    # reload dimatikan agar aman di production.
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
